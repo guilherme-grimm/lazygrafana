@@ -1,0 +1,32 @@
+# lazygrafana config for the local dev stack. Token files are created by
+# `make dev-bootstrap` (and `make dev-bootstrap-compat`); relative paths are
+# resolved against this file's directory.
+#
+#   lazygrafana --config dev/lazygrafana.yml
+
+default_context: local
+default_time: now-3h
+graphics: auto
+
+contexts:
+  local:
+    url: http://localhost:3000
+    token_file: .secrets/admin.token
+
+  local-viewer:
+    url: http://localhost:3000
+    token_file: .secrets/viewer.token
+    readonly: true
+
+  team-b:
+    url: http://localhost:3000
+    org: 2
+    token_file: .secrets/team-b.token
+
+  grafana-11:
+    url: http://localhost:3011
+    token_file: .secrets/compat-admin.token
+
+  broken:
+    url: http://localhost:3999
+    token_file: .secrets/admin.token

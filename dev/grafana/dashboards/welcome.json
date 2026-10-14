@@ -1,0 +1,60 @@
+{
+  "uid": "lg-welcome",
+  "title": "Welcome to lazygrafana dev",
+  "tags": [
+    "dev"
+  ],
+  "description": "",
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "About this stack",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": null,
+      "targets": [],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "# lazygrafana dev stack\n\n* **Platform/Demo Signals** - synthetic, backfilled signals with a spike every 15 min\n* **Platform/Node Overview** - your machine via node-exporter\n* **Platform/Self Monitoring** - histograms, heatmap, state timeline\n* **Logs/Service Logs** - Loki logs from flog generators\n\nAlert rules live in the *Dev Alerts* folder."
+      }
+    }
+  ]
+}

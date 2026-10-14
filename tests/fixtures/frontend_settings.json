@@ -1,0 +1,16 @@
+{
+  "buildInfo": {
+    "hideVersion": false,
+    "version": "13.2.4",
+    "versionString": "Grafana v13.2.4 (0e79aef9d9)",
+    "commit": "0e79aef9d91abf3bdadae9af15763029072fb45b",
+    "commitShort": "0e79aef9d9",
+    "buildstamp": 1791809853,
+    "edition": "Open Source",
+    "latestVersion": "",
+    "hasUpdate": false,
+    "env": "production"
+  },
+  "appUrl": "http://localhost:3000/",
+  "appSubUrl": ""
+}

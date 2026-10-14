@@ -1,0 +1,121 @@
+# Local Grafana stack for developing lazygrafana.
+#
+#   make dev-up          # grafana + prometheus + loki + alloy + log generators
+#   make dev-bootstrap   # tokens, scratch dashboards, folders, orgs, backfilled history
+#
+# Profiles:
+#   compat    - also starts Grafana 11 (minimum supported version) on :3011
+#   renderer  - starts the Grafana Image Renderer (for the "exact view" feature)
+
+name: lazygrafana-dev
+
+x-grafana: &grafana
+  restart: unless-stopped
+  environment: &grafana-env
+    GF_SECURITY_ADMIN_USER: admin
+    GF_SECURITY_ADMIN_PASSWORD: admin
+    GF_LOG_LEVEL: warn
+    GF_ANALYTICS_REPORTING_ENABLED: "false"
+    GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    GF_NEWS_NEWS_FEED_ENABLED: "false"
+    GF_RENDERING_SERVER_URL: http://renderer:8081/render
+    GF_RENDERING_RENDERER_TOKEN: &renderer-token lazygrafana-dev-renderer
+    GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+  depends_on: [prometheus, loki]
+
+services:
+  grafana:
+    <<: *grafana
+    image: grafana/grafana:${GRAFANA_VERSION:-13.2.4}
+    ports: ["${GRAFANA_PORT:-3000}:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+  grafana-11:
+    <<: *grafana
+    image: grafana/grafana:${GRAFANA_COMPAT_VERSION:-11.6.16}
+    profiles: [compat]
+    ports: ["${GRAFANA_COMPAT_PORT:-3011}:3000"]
+    environment:
+      <<: *grafana-env
+      GF_RENDERING_CALLBACK_URL: http://grafana-11:3000/
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-11-data:/var/lib/grafana
+
+  renderer:
+    image: grafana/grafana-image-renderer:${RENDERER_VERSION:-v5.12.7}
+    profiles: [renderer]
+    restart: unless-stopped
+    environment:
+      AUTH_TOKEN: *renderer-token
+
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_VERSION:-v3.15.0}
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+    ports: ["${PROMETHEUS_PORT:-9090}:9090"]
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+
+  loki:
+    image: grafana/loki:${LOKI_VERSION:-3.7.8}
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/loki/local-config.yaml
+      # Dev machines often run >90% disk; don't let the WAL silently drop logs.
+      - -ingester.wal-disk-full-threshold=0
+    ports: ["${LOKI_PORT:-3100}:3100"]
+    volumes:
+      - loki-data:/loki
+
+  alloy:
+    image: grafana/alloy:${ALLOY_VERSION:-v1.20.1}
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [loki]
+
+  node-exporter:
+    image: prom/node-exporter:${NODE_EXPORTER_VERSION:-v1.12.1}
+    restart: unless-stopped
+    command: [--path.rootfs=/host]
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+
+  # Fake log sources, picked up by Alloy through the Docker socket.
+  logs-api:
+    image: mingrammer/flog:${FLOG_VERSION:-0.4.3}
+    restart: unless-stopped
+    command: [--format=json, --loop, --delay=250ms]
+
+  logs-web:
+    image: mingrammer/flog:${FLOG_VERSION:-0.4.3}
+    restart: unless-stopped
+    command: [--format=apache_combined, --loop, --delay=500ms]
+
+  logs-errors:
+    image: mingrammer/flog:${FLOG_VERSION:-0.4.3}
+    restart: unless-stopped
+    command: [--format=apache_error, --loop, --delay=2s]
+
+volumes:
+  grafana-data:
+  grafana-11-data:
+  prometheus-data:
+  loki-data:

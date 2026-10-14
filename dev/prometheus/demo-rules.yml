@@ -1,0 +1,32 @@
+# Deterministic synthetic signals that depend only on time(), so they can be
+# backfilled into the past with `promtool tsdb create-blocks-from rules`
+# (see dev/bootstrap.sh). That gives every chart days of history to zoom into.
+groups:
+  - name: demo
+    interval: 15s
+    rules:
+      # Slow waves (~31 min period), phase-shifted per region.
+      - record: demo_signal
+        expr: 50 + 40 * sin(vector(time() / 300))
+        labels: { shape: sine, region: eu-west-1 }
+      - record: demo_signal
+        expr: 50 + 40 * sin(vector(time() / 300 + 1.5))
+        labels: { shape: sine, region: us-east-1 }
+
+      # A 45s spike every 15 minutes: the thing you want to select and zoom into.
+      - record: demo_signal
+        expr: vector(5 + 90 * (time() % 900 < bool 45))
+        labels: { shape: spike, region: eu-west-1 }
+
+      # Ramps up over 10 minutes, then drops.
+      - record: demo_signal
+        expr: vector((time() % 600) / 6)
+        labels: { shape: sawtooth, region: us-east-1 }
+
+      # A daily-ish "traffic" curve with a lunch dip, for longer time ranges.
+      - record: demo_requests_per_second
+        expr: 800 + 600 * sin(vector(time() / 13751)) - vector(150 * (time() % 86400 > bool 43200) * (time() % 86400 < bool 46800))
+        labels: { service: checkout }
+      - record: demo_requests_per_second
+        expr: 300 + 200 * sin(vector(time() / 13751 + 0.7))
+        labels: { service: search }

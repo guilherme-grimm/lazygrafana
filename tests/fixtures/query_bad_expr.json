@@ -1,0 +1,1 @@
+{"results":{"A":{"error":"bad_data: invalid parameter \"query\": 1:4: parse error: unexpected end of input inside braces","errorSource":"downstream","status":400,"frames":[{"schema":{"refId":"A","meta":{"typeVersion":[0,0],"custom":{"calculatedMinStep":30000},"executedQueryString":"Expr: up{\nStep: 30s"},"fields":[]},"data":{"values":[]}}]}}}

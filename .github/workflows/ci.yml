@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+      - run: cargo build --release
+
+  # Runs the API-level tests against the docker dev stack: Grafana 13 + Grafana 11.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start dev stack
+        run: |
+          docker compose -f dev/docker-compose.yml --profile compat up -d
+          ./dev/bootstrap.sh
+          GRAFANA_URL=http://localhost:3011 SECRETS_PREFIX=compat- SKIP_BACKFILL=1 ./dev/bootstrap.sh
+          # Give the alert rules a couple of evaluation cycles.
+          sleep 30
+      - run: LAZYGRAFANA_IT=1 cargo test --test integration
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f dev/docker-compose.yml --profile compat logs --tail=100
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

@@ -1,0 +1,4 @@
+/target
+dev/.secrets/
+*.log
+.env

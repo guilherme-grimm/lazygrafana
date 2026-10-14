@@ -1,0 +1,1 @@
+{"results":{"A":{"error":"Post \"http://does-not-exist:9090/api/v1/query_range\": dial tcp: lookup does-not-exist on 127.0.0.11:53: no such host","errorSource":"downstream","status":502,"frames":[]}}}

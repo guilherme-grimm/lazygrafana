@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: lazygrafana-dev
+    orgId: 1
+    type: file
+    disableDeletion: false
+    # Lets lazygrafana save edits through the API (they reset if the file changes).
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: true

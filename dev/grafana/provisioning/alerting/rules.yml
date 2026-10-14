@@ -1,0 +1,110 @@
+# Alert rules with predictable behaviour, driven by dev/prometheus/demo-rules.yml:
+#   AlwaysFiring - firing permanently
+#   SpikeDetected - fires for ~45s every 15 minutes (follows the spike signal)
+#   SineHigh      - goes Pending, then Firing, then back to Normal every ~31 minutes
+#   ScrapeDown    - normal unless you stop a container (e.g. `docker compose stop node-exporter`)
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: demo-signals
+    folder: Dev Alerts
+    interval: 10s
+    rules:
+      - uid: always-firing
+        title: AlwaysFiring
+        condition: C
+        for: 0s
+        noDataState: NoData
+        execErrState: Error
+        labels: { severity: info, team: platform }
+        annotations:
+          summary: This rule always fires. Useful for testing silences.
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange: { from: 300, to: 0 }
+            model: { refId: A, expr: vector(1), instant: true }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+
+      - uid: spike-detected
+        title: SpikeDetected
+        condition: C
+        for: 0s
+        noDataState: NoData
+        execErrState: Error
+        labels: { severity: warning, team: platform, region: eu-west-1 }
+        annotations:
+          summary: demo_signal spiked above 50 in eu-west-1.
+          description: Fires for ~45s every 15 minutes.
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange: { from: 300, to: 0 }
+            model: { refId: A, expr: 'demo_signal{shape="spike"}', instant: true }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [50] }
+
+      - uid: sine-high
+        title: SineHigh
+        condition: C
+        for: 1m
+        noDataState: NoData
+        execErrState: Error
+        labels: { severity: critical, team: checkout }
+        annotations:
+          summary: 'Sine wave in {{ $labels.region }} is above 80.'
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange: { from: 300, to: 0 }
+            model: { refId: A, expr: 'demo_signal{shape="sine"}', instant: true }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [80] }
+
+  - orgId: 1
+    name: infrastructure
+    folder: Dev Alerts
+    interval: 30s
+    rules:
+      - uid: scrape-down
+        title: ScrapeDown
+        condition: C
+        for: 30s
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: critical, team: platform }
+        annotations:
+          summary: 'Prometheus cannot scrape {{ $labels.job }}.'
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange: { from: 300, to: 0 }
+            model: { refId: A, expr: up == 0, instant: true }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [-1] }
