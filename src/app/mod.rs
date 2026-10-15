@@ -969,6 +969,8 @@ mod tests {
         let generation = app.dash.as_ref().unwrap().generation;
         let resp: DashboardResponse = fixture("dashboard_demo.json");
         app.on_msg(Msg::Dashboard { generation: generation | (1 << 63), result: Ok(resp) });
+        // Override the dashboard's relative default with the fixture's range, so tests don't depend on the clock.
+        app.time.push(crate::timerange::TimeRange::absolute(1_792_000_000_000, 1_792_003_600_000));
         // Feed every panel the range-query fixture.
         let ids: Vec<i64> = app.dash.as_ref().unwrap().dash.as_ref().unwrap().panels.iter().map(|p| p.id).collect();
         let query_gen = app.dash.as_ref().unwrap().query_gen;
