@@ -365,7 +365,12 @@ struct WireEntities {
 
 impl Frame {
     pub fn from_json(v: &Value) -> Result<Self, String> {
-        let w: WireFrame = serde_json::from_value(v.clone()).map_err(|e| format!("invalid data frame: {e}"))?;
+        Self::from_value(v.clone())
+    }
+
+    /// Like `from_json`, but consumes the value (no copy of large frames).
+    pub fn from_value(v: Value) -> Result<Self, String> {
+        let w: WireFrame = serde_json::from_value(v).map_err(|e| format!("invalid data frame: {e}"))?;
         let mut fields = Vec::with_capacity(w.schema.fields.len());
         for (i, wf) in w.schema.fields.into_iter().enumerate() {
             let raw = w.data.values.get(i).cloned().unwrap_or_default();

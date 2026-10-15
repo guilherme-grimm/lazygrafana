@@ -99,7 +99,7 @@ groups:
           - refId: A
             datasourceUid: prometheus
             relativeTimeRange: { from: 300, to: 0 }
-            model: { refId: A, expr: up == 0, instant: true }
+            model: { refId: A, expr: 'up{job!="avalanche"} == 0', instant: true }
           - refId: C
             datasourceUid: __expr__
             model:

@@ -16,7 +16,7 @@ lint: ## Formatting and clippy
 run: ## Run against the dev stack
 	cargo run -- --config dev/lazygrafana.yml
 
-.PHONY: build test test-it lint run dev-up dev-up-all dev-bootstrap dev-bootstrap-compat dev-down dev-reset dev-logs dev-ps
+.PHONY: build test test-it lint run load-up load-seed load-clean load-down dev-up dev-up-all dev-bootstrap dev-bootstrap-compat dev-down dev-reset dev-logs dev-ps
 
 dev-up: ## Start the core dev stack (Grafana 13, Prometheus, Loki, Alloy, log generators)
 	$(COMPOSE) up -d
@@ -42,3 +42,15 @@ dev-logs: ## Follow logs of all services
 
 dev-ps: ## Show service status
 	$(COMPOSE) ps
+
+load-up: ## Start the load profile (avalanche metrics + log floods)
+	$(COMPOSE) --profile load up -d
+
+load-seed: ## Seed ~300 dashboards, heavy dashboards and ~100 alert rules
+	./dev/load/seed.py
+
+load-clean: ## Remove the seeded load-test content
+	./dev/load/seed.py --clean
+
+load-down: ## Stop the load profile services
+	$(COMPOSE) --profile load stop avalanche avalanche-wide load-logs load-logs-apache

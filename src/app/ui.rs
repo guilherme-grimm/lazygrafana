@@ -512,6 +512,17 @@ impl App {
                 }
             }
             "help" | "h" => self.popup = Some(Popup::help()),
+            "stats" => {
+                let mut lines: Vec<Line<'static>> = self.perf.report().into_iter().map(Line::raw).collect();
+                lines.push(Line::raw(""));
+                lines.push(Line::raw(format!(
+                    "graphics              {} ({}×{} px cells)",
+                    self.gfx.mode.name(),
+                    self.gfx.cell.0,
+                    self.gfx.cell.1
+                )));
+                self.popup = Some(Popup::text("Stats", lines));
+            }
             "zoom" => {
                 let f: f64 = arg.parse().unwrap_or(2.0);
                 let r = self.time.current().zoom(now_ms(), None, f);

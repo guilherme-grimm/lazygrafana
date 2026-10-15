@@ -83,8 +83,34 @@ impl QueryResponse {
         self.results.iter().flat_map(|(_, r)| r.frames.iter().cloned()).collect()
     }
 
+    pub fn into_frames(self) -> Vec<Frame> {
+        self.results.into_iter().flat_map(|(_, r)| r.frames).collect()
+    }
+
     pub fn errors(&self) -> Vec<String> {
         self.results.iter().filter_map(|(id, r)| r.error.as_ref().map(|e| format!("{id}: {e}"))).collect()
+    }
+
+    /// Parses a response, consuming it so frames are moved rather than copied.
+    pub fn parse_owned(v: Value, order: &[String]) -> Self {
+        let Value::Object(mut root) = v else { return Self { results: Vec::new() } };
+        let Some(Value::Object(map)) = root.remove("results") else { return Self { results: Vec::new() } };
+        let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+        entries.sort_by_key(|(k, _)| order.iter().position(|o| o == k).unwrap_or(usize::MAX));
+        let results = entries
+            .into_iter()
+            .map(|(k, mut r)| {
+                let error = r.get("error").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+                let frames = match r.get_mut("frames").map(Value::take) {
+                    Some(Value::Array(fs)) => {
+                        fs.into_iter().filter_map(|f| Frame::from_value(f).ok()).filter(|f| !f.fields.is_empty()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                (k, QueryResult { frames, error })
+            })
+            .collect();
+        Self { results }
     }
 
     pub fn parse(v: &Value, order: &[String]) -> Self {
@@ -308,7 +334,7 @@ impl Client {
             let msg = v.get("message").and_then(Value::as_str).unwrap_or("query failed").to_string();
             return Err(ApiError::new(None, msg));
         }
-        Ok(QueryResponse::parse(&v, &order))
+        Ok(QueryResponse::parse_owned(v, &order))
     }
 
     pub async fn datasources(&self) -> ApiResult<Vec<Datasource>> {
@@ -519,5 +545,25 @@ mod tests {
         let c = Client::new(&ctx("http://127.0.0.1:1")).unwrap();
         let e = c.health().await.unwrap_err();
         assert!(e.message.contains("cannot connect"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod perf {
+    /// Times parsing of a real /api/ds/query response: LG_BIG_QUERY=path cargo test --release parse_big -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn parse_big() {
+        let path = std::env::var("LG_BIG_QUERY").unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let t_json = t.elapsed();
+            let r = super::QueryResponse::parse(&v, &["A".to_string()]);
+            let t_parse = t.elapsed();
+            let s = crate::grafana::dataframe::series_from_frames(&r.frames());
+            eprintln!("{} bytes: json {:?}, frames {:?}, series {:?} ({} series)", bytes.len(), t_json, t_parse, t.elapsed(), s.len());
+        }
     }
 }

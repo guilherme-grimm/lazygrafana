@@ -21,3 +21,7 @@ scrape_configs:
   - job_name: alloy
     static_configs:
       - targets: [alloy:12345]
+  # load profile (targets are simply down when the profile isn't running)
+  - job_name: avalanche
+    static_configs:
+      - targets: [avalanche:9001, avalanche-wide:9001]

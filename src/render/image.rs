@@ -101,10 +101,44 @@ struct Slot {
 pub struct ImageCache {
     slots: HashMap<String, Slot>,
     next_id: u32,
+    /// Built chart specs (downsampled data), keyed like slots.
+    specs: HashMap<String, (u64, std::rc::Rc<ChartSpec>)>,
+    /// Rendered Unicode chart bases, keyed like slots.
+    cells: HashMap<String, (u64, ratatui::buffer::Buffer)>,
+    used: std::collections::HashSet<String>,
+    /// Rasterise + encode durations since the last drain (for `:stats`).
+    pub timings: Vec<std::time::Duration>,
 }
 
 impl ImageCache {
+    /// Returns the cached spec for `key` if built from the same `version`, else builds it.
+    pub fn spec(&mut self, key: &str, version: u64, make: impl FnOnce() -> ChartSpec) -> std::rc::Rc<ChartSpec> {
+        self.used.insert(key.to_string());
+        if version != 0
+            && let Some((v, spec)) = self.specs.get(key)
+            && *v == version
+        {
+            return spec.clone();
+        }
+        let spec = std::rc::Rc::new(make());
+        if version != 0 {
+            self.specs.insert(key.to_string(), (version, spec.clone()));
+        }
+        spec
+    }
+
+    /// Cached Unicode rendering of a chart's static part.
+    pub fn cells(&mut self, key: &str, version: u64) -> Option<&ratatui::buffer::Buffer> {
+        self.used.insert(key.to_string());
+        self.cells.get(key).filter(|(v, _)| *v == version).map(|(_, b)| b)
+    }
+
+    pub fn put_cells(&mut self, key: &str, version: u64, buf: ratatui::buffer::Buffer) {
+        self.cells.insert(key.to_string(), (version, buf));
+    }
+
     fn slot(&mut self, key: &str) -> &mut Slot {
+        self.used.insert(key.to_string());
         if !self.slots.contains_key(key) {
             // Kitty ids must be non-zero; keep them small and stable per slot.
             self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -131,6 +165,8 @@ impl ImageCache {
         let area = layout.plot;
         let (w, h) = (area.width as u32 * gfx.cell.0 as u32, area.height as u32 * gfx.cell.1 as u32);
         let base_key = spec.base_hash() ^ ((w as u64) << 32 | h as u64) ^ hash_layout(layout);
+        let started = std::time::Instant::now();
+        let mut work = false;
         let slot = self.slot(key);
         let base_changed = slot.base_key != base_key || slot.base.is_none() || slot.size != (w, h);
         if base_changed {
@@ -147,8 +183,12 @@ impl ImageCache {
             };
             slot.protocol = encode(gfx, slot.id, composed, area);
             slot.overlay = *overlay;
+            work = true;
         }
-        slot.protocol.as_ref()
+        if work {
+            self.timings.push(started.elapsed());
+        }
+        self.slots.get(key).and_then(|s| s.protocol.as_ref())
     }
 
     pub fn heatmap(&mut self, key: &str, gfx: &GraphicsState, spec: &raster::HeatmapSpec, area: Rect) -> Option<&Protocol> {
@@ -201,14 +241,20 @@ impl ImageCache {
         for s in self.slots.values_mut() {
             s.used = false;
         }
+        self.used.clear();
     }
 
     pub fn sweep(&mut self) {
         self.slots.retain(|_, s| s.used);
+        let used = &self.used;
+        self.specs.retain(|k, _| used.contains(k));
+        self.cells.retain(|k, _| used.contains(k));
     }
 
     pub fn clear(&mut self) {
         self.slots.clear();
+        self.specs.clear();
+        self.cells.clear();
     }
 }
 

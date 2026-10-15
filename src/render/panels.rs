@@ -9,7 +9,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, Widget, Wrap};
 use serde_json::Value;
 
-use super::chart::{ChartAnnotation, ChartLayout, ChartSeries, ChartSpec, Overlay, Rgb, ThresholdStyle, render_unicode};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
+use super::chart::{
+    ChartAnnotation, ChartLayout, ChartSeries, ChartSpec, Overlay, Rgb, ThresholdStyle, render_overlay_cells, render_unicode,
+    render_unicode_base,
+};
 use super::image::{GraphicsState, ImageCache};
 use super::raster::{HeatmapSpec, heat_color};
 use crate::grafana::dashboard::Panel;
@@ -27,6 +33,54 @@ pub struct PanelData {
     pub range: (Millis, Millis),
     /// Step in ms actually used, for the aliasing hint.
     pub step: Option<Millis>,
+    /// Identity of this result for render caches (0 = uncached).
+    pub version: u64,
+    /// Data points received (for `:stats`).
+    pub points: usize,
+}
+
+impl PanelData {
+    /// Turns a query response into ready-to-draw data. Runs in the background
+    /// task, so the UI thread only swaps the result in. Raw frames are kept only
+    /// when `keep_frames` (tables, Explore's table view).
+    pub fn prepare(resp: crate::grafana::QueryResponse, range: (Millis, Millis), step: Millis, keep_frames: bool) -> Self {
+        let errors = resp.errors();
+        let frames = resp.into_frames();
+        let points = frames.iter().map(|f| f.len() * f.fields.len().saturating_sub(1)).sum();
+        let mut logs = crate::grafana::dataframe::logs_from_frames(&frames);
+        logs.sort_by_key(|l| std::cmp::Reverse(l.time));
+        Self {
+            series: crate::grafana::dataframe::series_from_frames(&frames),
+            logs,
+            frames: if keep_frames { frames } else { Vec::new() },
+            errors,
+            loading: false,
+            range,
+            step: Some(step),
+            version: next_version(),
+            points,
+        }
+    }
+
+    /// No frames, series or log lines.
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty() && self.series.is_empty() && self.logs.is_empty()
+    }
+}
+
+static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh, unique data version.
+pub fn next_version() -> u64 {
+    VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sorted, de-duplicated timestamps of a result (crosshair stops).
+pub fn timestamps(data: &PanelData) -> Vec<Millis> {
+    let mut ts: Vec<Millis> = data.series.iter().flat_map(|s| s.points.iter().map(|(t, _)| *t)).collect();
+    ts.sort_unstable();
+    ts.dedup();
+    ts
 }
 
 pub struct PanelCtx<'a> {
@@ -58,7 +112,8 @@ fn series_color(panel: &Panel, name: &str, idx: usize) -> Rgb {
 }
 
 /// Builds the chart description for a time series panel.
-pub fn chart_spec(panel: &Panel, data: &PanelData, annotations: &[ChartAnnotation]) -> ChartSpec {
+/// Builds the chart for a panel, downsampled to `buckets` columns (min/max per column).
+pub fn chart_spec(panel: &Panel, data: &PanelData, annotations: &[ChartAnnotation], buckets: usize) -> ChartSpec {
     let series = data
         .series
         .iter()
@@ -68,7 +123,11 @@ pub fn chart_spec(panel: &Panel, data: &PanelData, annotations: &[ChartAnnotatio
             ChartSeries {
                 name: s.name.clone(),
                 color: series_color(panel, &s.name, i),
-                points: s.points.iter().map(|(t, v)| (*t, v.map(|v| if negate { -v } else { v }))).collect(),
+                points: {
+                    let mapped: Vec<(Millis, Option<f64>)> =
+                        s.points.iter().map(|(t, v)| (*t, v.map(|v| if negate { -v } else { v }))).collect();
+                    super::chart::downsample(&mapped, data.range, buckets)
+                },
             }
         })
         .collect();
@@ -91,16 +150,23 @@ pub fn chart_spec(panel: &Panel, data: &PanelData, annotations: &[ChartAnnotatio
         fill_opacity: d.fill_opacity,
         line_width: d.line_width,
         stacking: d.stacking,
+        version: data.version,
     }
 }
 
 /// Renders `panel` into `area` (inside its border). Returns the chart layout for
 /// time series panels, so mouse positions can be mapped to time.
-pub fn render_panel(panel: &Panel, data: &PanelData, area: Rect, buf: &mut Buffer, ctx: &mut PanelCtx) -> Option<(ChartLayout, ChartSpec)> {
+pub fn render_panel(
+    panel: &Panel,
+    data: &PanelData,
+    area: Rect,
+    buf: &mut Buffer,
+    ctx: &mut PanelCtx,
+) -> Option<(ChartLayout, Rc<ChartSpec>)> {
     if area.width < 4 || area.height < 1 {
         return None;
     }
-    if !data.errors.is_empty() && data.series.is_empty() && data.frames.is_empty() {
+    if !data.errors.is_empty() && data.is_empty() {
         let text: Vec<Line> = data.errors.iter().map(|e| Line::styled(format!("⚠ {e}"), Style::default().fg(Color::LightRed))).collect();
         Paragraph::new(text).wrap(Wrap { trim: true }).render(area, buf);
         return None;
@@ -113,11 +179,11 @@ pub fn render_panel(panel: &Panel, data: &PanelData, area: Rect, buf: &mut Buffe
         render_placeholder(panel, area, buf);
         return None;
     }
-    if data.loading && data.frames.is_empty() {
+    if data.loading && data.is_empty() {
         buf.set_string(area.x, area.y, "loading…", Style::default().fg(DIM));
         return None;
     }
-    if data.frames.is_empty() {
+    if data.is_empty() {
         buf.set_string(area.x, area.y, "No data", Style::default().fg(DIM));
         return None;
     }
@@ -140,8 +206,21 @@ pub fn render_timeseries(
     area: Rect,
     buf: &mut Buffer,
     ctx: &mut PanelCtx,
-) -> Option<(ChartLayout, ChartSpec)> {
-    let spec = chart_spec(panel, data, ctx.annotations);
+) -> Option<(ChartLayout, Rc<ChartSpec>)> {
+    // Draw at most two points per pixel column, and reuse the built chart while the data is unchanged.
+    let per_cell = if ctx.gfx.mode.is_image() && ctx.images { ctx.gfx.cell.0 as usize } else { 2 };
+    let buckets = (area.width as usize * per_cell).max(16);
+    let version = if data.version == 0 {
+        0
+    } else {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (data.version, buckets, panel.id, ctx.annotations.len()).hash(&mut h);
+        for a in ctx.annotations {
+            (a.start, a.end).hash(&mut h);
+        }
+        h.finish().max(1)
+    };
+    let spec = ctx.cache.spec(&format!("{}#spec", ctx.key), version, || chart_spec(panel, data, ctx.annotations, buckets));
     let legend_mode = panel.options.pointer("/legend/showLegend").and_then(Value::as_bool).unwrap_or(true)
         && panel.options.pointer("/legend/displayMode").and_then(Value::as_str) != Some("hidden");
     let legend_rows = if legend_mode && area.height >= 6 {
@@ -174,10 +253,42 @@ pub fn render_chart(spec: &ChartSpec, area: Rect, buf: &mut Buffer, ctx: &mut Pa
         drawn = true;
     }
     if !drawn {
-        render_unicode(spec, &layout, &ctx.overlay, ctx.marker, buf);
+        render_unicode_cached(spec, &layout, buf, ctx);
     }
     layout.render_axes(spec, area, buf);
     layout
+}
+
+/// Unicode chart: the static base is cached per chart (keyed by data version and
+/// geometry), so moving the crosshair only repaints the overlay cells.
+fn render_unicode_cached(spec: &ChartSpec, layout: &ChartLayout, buf: &mut Buffer, ctx: &mut PanelCtx) {
+    let plot = layout.plot;
+    if spec.version == 0 {
+        render_unicode(spec, layout, &ctx.overlay, ctx.marker, buf);
+        return;
+    }
+    let key = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (spec.base_hash(), plot.width, plot.height, format!("{:?}", ctx.marker)).hash(&mut h);
+        h.finish()
+    };
+    let cell_key = format!("{}#cells", ctx.key);
+    if ctx.cache.cells(&cell_key, key).is_none() {
+        let mut tmp = Buffer::empty(plot);
+        render_unicode_base(spec, layout, ctx.marker, &mut tmp);
+        ctx.cache.put_cells(&cell_key, key, tmp);
+    }
+    if let Some(cached) = ctx.cache.cells(&cell_key, key) {
+        let src = cached.area;
+        for dy in 0..plot.height.min(src.height) {
+            for dx in 0..plot.width.min(src.width) {
+                if let (Some(from), Some(to)) = (cached.cell((src.x + dx, src.y + dy)), buf.cell_mut((plot.x + dx, plot.y + dy))) {
+                    *to = from.clone();
+                }
+            }
+        }
+    }
+    render_overlay_cells(spec, layout, &ctx.overlay, buf);
 }
 
 fn render_legend(spec: &ChartSpec, data: &PanelData, area: Rect, buf: &mut Buffer, crosshair: Option<Millis>, calcs: &[String]) {
@@ -813,8 +924,12 @@ mod tests {
             }
         }
         // Charts with crosshair/selection at the edges and outside the range.
-        let spec =
-            chart_spec(&kinds[0], &datasets[0], &[ChartAnnotation { start: 0, end: i64::MAX / 2, color: (1, 2, 3), text: String::new() }]);
+        let spec = chart_spec(
+            &kinds[0],
+            &datasets[0],
+            &[ChartAnnotation { start: 0, end: i64::MAX / 2, color: (1, 2, 3), text: String::new() }],
+            10_000,
+        );
         for (w, h) in [(1, 1), (5, 2), (20, 3), (80, 20)] {
             let area = Rect::new(0, 0, w, h);
             let mut buf = Buffer::empty(area);

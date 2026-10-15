@@ -19,7 +19,7 @@ use super::query::adhoc_query;
 use super::widgets::{InputResult, ListNav, TextInput};
 use super::{App, Focus, Side};
 use crate::grafana::dashboard::Panel;
-use crate::grafana::dataframe::{LogLine, logs_from_frames, series_from_frames};
+use crate::grafana::dataframe::LogLine;
 use crate::grafana::models::Datasource;
 use crate::render::chart::Overlay;
 use crate::render::panels::{PanelCtx, PanelData, frames_table, render_logs, render_rows, render_timeseries};
@@ -178,7 +178,7 @@ impl App {
         let generation = self.explore.generation;
         self.spawn_query(move |c| async move {
             let req = crate::grafana::QueryRequest { from: range.0, to: range.1, queries: vec![q] };
-            Msg::Explore { generation, range, step, append, result: c.query(&req).await }
+            Msg::Explore { generation, range, append, result: c.query(&req).await.map(|r| PanelData::prepare(r, range, step, true)) }
         });
     }
 
@@ -213,19 +213,17 @@ impl App {
 
     pub fn on_explore_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Explore { generation, range, step, append, result } => {
+            Msg::Explore { generation, range, append, result } => {
                 if generation != self.explore.generation {
                     return;
                 }
                 self.explore.loading = false;
                 match result {
-                    Ok(resp) => {
-                        let frames = resp.frames();
-                        let mut logs = logs_from_frames(&frames);
-                        logs.sort_by_key(|l| std::cmp::Reverse(l.time));
+                    Ok(data) => {
+                        self.perf.points(data.points);
                         if append && let Some(prev) = &mut self.explore.result {
                             let seen: HashSet<String> = prev.logs.iter().map(LogLine::key).collect();
-                            let new: Vec<LogLine> = logs.into_iter().filter(|l| !seen.contains(&l.key())).collect();
+                            let new: Vec<LogLine> = data.logs.into_iter().filter(|l| !seen.contains(&l.key())).collect();
                             if !new.is_empty() {
                                 // Keep the cursor on the same line while new lines arrive on top.
                                 if self.explore.log_nav.selected > 0 {
@@ -239,15 +237,7 @@ impl App {
                             }
                             return;
                         }
-                        self.explore.result = Some(PanelData {
-                            series: series_from_frames(&frames),
-                            logs,
-                            frames,
-                            errors: resp.errors(),
-                            loading: false,
-                            range,
-                            step: Some(step),
-                        });
+                        self.explore.result = Some(data);
                     }
                     Err(e) => {
                         if append {

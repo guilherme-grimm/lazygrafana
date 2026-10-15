@@ -8,6 +8,7 @@ pub mod datasources;
 pub mod explore;
 pub mod keymap;
 pub mod msg;
+pub mod perf;
 pub mod popup;
 pub mod query;
 pub mod ui;
@@ -33,6 +34,8 @@ use crate::timerange::{Jumplist, Millis, TimeRange, now_ms, parse_duration};
 use keymap::{Act, Keymap, Lookup};
 use msg::{After, InstanceInfo, Msg};
 use popup::Popup;
+
+pub type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<perf::CountingStdout>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -74,7 +77,7 @@ pub struct Toast {
 }
 
 /// A drawn time series: its layout (for pixel ↔ time mapping) and data.
-pub type DrawnChart = (crate::render::chart::ChartLayout, crate::render::chart::ChartSpec);
+pub type DrawnChart = (crate::render::chart::ChartLayout, std::rc::Rc<crate::render::chart::ChartSpec>);
 
 /// Screen regions from the last frame, for mouse hit-testing.
 #[derive(Default)]
@@ -134,6 +137,7 @@ pub struct App {
     pub max_over_time: bool,
     pub drag_anchor: Option<Millis>,
     pub size: (u16, u16),
+    pub perf: perf::Perf,
 }
 
 impl App {
@@ -185,6 +189,7 @@ impl App {
             max_over_time: false,
             drag_anchor: None,
             size: (0, 0),
+            perf: perf::Perf::default(),
         };
         app.contexts.select_name(ctx_name);
         for w in app.keymap.warnings.clone() {
@@ -292,9 +297,15 @@ impl App {
         let Some(client) = self.client.clone() else { return };
         let tx = self.tx.clone();
         let sem = self.query_limit.clone();
+        let in_flight = self.perf.in_flight.clone();
+        in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             let _permit = sem.acquire_owned().await;
-            let _ = tx.send(f(client).await);
+            let started = Instant::now();
+            let msg = f(client).await;
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = tx.send(Msg::QueryTimed(started.elapsed()));
+            let _ = tx.send(msg);
         });
     }
 
@@ -381,7 +392,7 @@ impl App {
 
     // ---- event loop -----------------------------------------------------------------
 
-    pub async fn run(mut self, terminal: &mut ratatui::DefaultTerminal, mut rx: mpsc::UnboundedReceiver<Msg>) -> Result<()> {
+    pub async fn run(mut self, terminal: &mut Term, mut rx: mpsc::UnboundedReceiver<Msg>) -> Result<()> {
         let mut events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut dirty = true;
@@ -389,11 +400,17 @@ impl App {
             if dirty {
                 self.images.begin_frame();
                 // Synchronized output: the terminal shows the frame atomically (no tearing).
-                crossterm::queue!(std::io::stdout(), crossterm::terminal::BeginSynchronizedUpdate)?;
+                let started = Instant::now();
+                crossterm::queue!(terminal.backend_mut(), crossterm::terminal::BeginSynchronizedUpdate)?;
                 terminal.draw(|f| self.render(f))?;
                 self.emit_links()?;
-                crossterm::execute!(std::io::stdout(), crossterm::terminal::EndSynchronizedUpdate)?;
+                crossterm::execute!(terminal.backend_mut(), crossterm::terminal::EndSynchronizedUpdate)?;
+                self.perf.frame(started.elapsed());
+                for d in self.images.timings.drain(..) {
+                    self.perf.encode(d);
+                }
                 self.images.sweep();
+                self.query_visible();
                 dirty = false;
             }
             tokio::select! {
@@ -420,6 +437,7 @@ impl App {
                 break;
             }
         }
+        tracing::info!("session stats:\n{}", self.perf.report().join("\n"));
         Ok(())
     }
 
@@ -776,6 +794,7 @@ impl App {
                     Err(e) => self.toast_err(format!("datasources: {e}")),
                 }
             }
+            Msg::QueryTimed(took) => self.perf.query(took),
             Msg::Done { ok, after, result } => match result {
                 Ok(()) => {
                     self.toast(ok);
@@ -848,7 +867,7 @@ impl App {
 
     // ---- external editor ----------------------------------------------------------------
 
-    fn run_editor(&mut self, terminal: &mut ratatui::DefaultTerminal, req: EditorRequest) -> Result<()> {
+    fn run_editor(&mut self, terminal: &mut Term, req: EditorRequest) -> Result<()> {
         let original = serde_json::to_string_pretty(&req.json)?;
         let mut file = tempfile::Builder::new().prefix(&format!("lazygrafana-{}-", req.uid)).suffix(".json").tempfile()?;
         file.write_all(original.as_bytes())?;
@@ -905,12 +924,14 @@ pub async fn run(config: Config, context: Option<String>, dashboard: Option<Stri
     let ctx_name = config.initial_context(context.as_deref())?;
     crate::term::install_panic_hook();
     crate::term::enter(config.mouse)?;
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+    let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(perf::CountingStdout::new(bytes.clone())))?;
     terminal.clear()?;
     let gfx = GraphicsState::detect(config.graphics);
     let (tx, rx) = mpsc::unbounded_channel();
     let result = match App::new(config, &ctx_name, gfx, tx) {
         Ok(mut app) => {
+            app.perf.bytes_total = bytes;
             if let Some(uid) = dashboard {
                 app.side = Side::Dashboards;
                 app.focus = Focus::Main;
@@ -980,14 +1001,9 @@ mod tests {
         let body: serde_json::Value = fixture("query_range.json");
         for id in ids {
             let resp = crate::grafana::QueryResponse::parse(&body, &["A".to_string()]);
-            app.on_msg(Msg::PanelData {
-                generation,
-                query_gen,
-                panel_id: id,
-                range: (1_792_000_000_000, 1_792_003_600_000),
-                step: 60_000,
-                result: Ok(resp),
-            });
+            let range = (1_792_000_000_000, 1_792_003_600_000);
+            let data = crate::render::panels::PanelData::prepare(resp, range, 60_000, true);
+            app.on_msg(Msg::PanelData { generation, query_gen, panel_id: id, range, result: Ok(data) });
         }
     }
 
