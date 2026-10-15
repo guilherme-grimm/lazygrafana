@@ -963,6 +963,9 @@ mod tests {
     use crate::grafana::models::{DashboardResponse, RuleGroup, SearchHit};
     use ratatui::backend::TestBackend;
 
+    const START_EPOCH: i64 = 1_792_000_000_000;
+    const END_EPOCH: i64 = 1_792_003_600_000;
+
     fn fixture<T: serde::de::DeserializeOwned>(name: &str) -> T {
         serde_json::from_str(&std::fs::read_to_string(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap()
     }
@@ -991,7 +994,7 @@ mod tests {
         let resp: DashboardResponse = fixture("dashboard_demo.json");
         app.on_msg(Msg::Dashboard { generation: generation | (1 << 63), result: Ok(resp) });
         // Override the dashboard's relative default with the fixture's range, so tests don't depend on the clock.
-        app.time.push(crate::timerange::TimeRange::absolute(1_792_000_000_000, 1_792_003_600_000));
+        app.time.push(crate::timerange::TimeRange::absolute(START_EPOCH, END_EPOCH));
         // Feed every panel the range-query fixture.
         let ids: Vec<i64> = app.dash.as_ref().unwrap().dash.as_ref().unwrap().panels.iter().map(|p| p.id).collect();
         let query_gen = app.dash.as_ref().unwrap().query_gen;
