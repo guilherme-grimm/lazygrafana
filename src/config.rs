@@ -151,7 +151,7 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let config: Self = serde_yaml_ng::from_str(text)?;
+        let config: Self = serde_saphyr::from_str(text)?;
         for (name, ctx) in &config.contexts {
             if ctx.url.is_empty() {
                 bail!("context '{name}' has no url");
