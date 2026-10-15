@@ -1,10 +1,11 @@
 //! Results of background tasks, delivered to the UI loop.
 
+use crate::grafana::ApiError;
 use crate::grafana::dataframe::Frame;
 use crate::grafana::models::*;
 use crate::grafana::variables::VarOption;
-use crate::grafana::{ApiError, QueryResponse};
 use crate::render::chart::ChartAnnotation;
+use crate::render::panels::PanelData;
 use crate::timerange::Millis;
 
 #[derive(Debug, Clone)]
@@ -60,8 +61,7 @@ pub enum Msg {
         query_gen: u64,
         panel_id: i64,
         range: (Millis, Millis),
-        step: Millis,
-        result: Result<QueryResponse, ApiError>,
+        result: Result<PanelData, ApiError>,
     },
     Annotations {
         generation: u64,
@@ -104,14 +104,13 @@ pub enum Msg {
     RuleChart {
         uid: String,
         range: (Millis, Millis),
-        result: Result<QueryResponse, ApiError>,
+        result: Result<PanelData, ApiError>,
     },
     Explore {
         generation: u64,
         range: (Millis, Millis),
-        step: Millis,
         append: bool,
-        result: Result<QueryResponse, ApiError>,
+        result: Result<PanelData, ApiError>,
     },
     LokiLabels {
         result: Result<Vec<String>, ApiError>,
@@ -126,6 +125,8 @@ pub enum Msg {
         after: After,
         result: Result<(), ApiError>,
     },
+    /// Wall time of a query task (sent just before its result).
+    QueryTimed(std::time::Duration),
 }
 
 #[derive(Debug, Clone)]

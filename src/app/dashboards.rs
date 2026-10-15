@@ -20,11 +20,11 @@ use super::query::build_panel_queries;
 use super::widgets::{InputResult, ListNav, Scroll, TextInput, fuzzy_filter, truncate};
 use super::{App, EditorRequest, Focus, Side};
 use crate::grafana::dashboard::{Dashboard, Panel};
-use crate::grafana::dataframe::{logs_from_frames, series_from_frames};
+use crate::grafana::dataframe::series_from_frames;
 use crate::grafana::models::{DashboardMeta, NewAnnotation, SearchHit, VersionInfo};
 use crate::grafana::variables::{self, Scope, VarKind, VarSet, post_process, resolve_ds};
 use crate::render::chart::{ChartAnnotation, Overlay};
-use crate::render::panels::{PanelCtx, PanelData, chart_spec, render_panel};
+use crate::render::panels::{PanelCtx, PanelData, render_panel};
 use crate::timerange::{Millis, TimeRange, now_ms};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +243,10 @@ pub struct OpenDashboard {
     pub exact: HashMap<i64, Result<Vec<u8>, String>>,
     pub exact_view: Option<i64>,
     pub vars_loading: bool,
+    /// Panels whose data is out of date for the current query generation.
+    pub stale: HashSet<i64>,
+    /// Panels on screen or within a screen of it, from the last frame (queried first).
+    pub near: Vec<i64>,
 }
 
 impl OpenDashboard {
@@ -304,6 +308,8 @@ impl App {
             exact: HashMap::new(),
             exact_view: None,
             vars_loading: false,
+            stale: HashSet::new(),
+            near: Vec::new(),
         });
         self.dashboards.push_recent(uid);
         self.images.clear();
@@ -371,32 +377,59 @@ impl App {
         (cells * per_cell).clamp(50, 2000)
     }
 
+    /// Marks every panel stale and queries the ones near the viewport; the rest
+    /// are queried as they scroll into view (like Grafana's lazy loading).
     pub fn query_dashboard(&mut self) {
+        let Some(d) = &mut self.dash else { return };
+        let Some(dash) = &d.dash else { return };
+        d.query_gen = next_gen();
+        d.stale = d.order.iter().map(|&pi| &dash.panels[pi]).filter(|p| p.needs_query() && !p.targets.is_empty()).map(|p| p.id).collect();
+        for id in &d.stale {
+            if let Some(data) = d.data.get_mut(id) {
+                data.loading = true;
+            }
+        }
+        self.query_visible();
+        self.load_annotations();
+    }
+
+    /// Queries stale panels that are on (or near) the screen.
+    pub fn query_visible(&mut self) {
         let range = self.range();
         let max_ot = self.max_over_time;
         let Some(d) = &self.dash else { return };
         let Some(dash) = &d.dash else { return };
-        let generation = d.generation;
-        let query_gen = next_gen();
+        if d.stale.is_empty() || d.vars_loading {
+            return;
+        }
+        let ids: Vec<i64> = d.near.iter().copied().filter(|id| d.stale.contains(id)).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let (generation, query_gen) = (d.generation, d.query_gen);
         let mut jobs = Vec::new();
-        for &pi in &d.order {
-            let panel = &dash.panels[pi];
-            if !panel.needs_query() || panel.targets.is_empty() {
-                continue;
-            }
+        for id in &ids {
+            let Some(panel) = dash.panels.iter().find(|p| p.id == *id) else { continue };
             let points = self.panel_points(panel);
-            let built = build_panel_queries(panel, &d.vars, &self.ds_list, range, points, max_ot);
-            jobs.push((panel.id, built));
+            tracing::debug!(panel = id, points, size = ?self.size, "query panel");
+            jobs.push((*id, panel.kind.starts_with("table"), build_panel_queries(panel, &d.vars, &self.ds_list, range, points, max_ot)));
         }
         let Some(d) = &mut self.dash else { return };
-        d.query_gen = query_gen;
+        for id in &ids {
+            d.stale.remove(id);
+        }
         let mut requests = Vec::new();
-        for (panel_id, built) in jobs {
+        for (panel_id, keep_frames, built) in jobs {
             let entry = d.data.entry(panel_id).or_default();
             match built {
                 Ok(b) => {
                     entry.loading = true;
-                    requests.push((panel_id, b.step, crate::grafana::QueryRequest { from: range.0, to: range.1, queries: b.queries }));
+                    requests.push((
+                        panel_id,
+                        b.step,
+                        keep_frames,
+                        crate::grafana::QueryRequest { from: range.0, to: range.1, queries: b.queries },
+                    ));
                 }
                 Err(e) if e == "no queries" => {}
                 Err(e) => {
@@ -404,12 +437,12 @@ impl App {
                 }
             }
         }
-        for (panel_id, step, req) in requests {
+        for (panel_id, step, keep_frames, req) in requests {
             self.spawn_query(move |c| async move {
-                Msg::PanelData { generation, query_gen, panel_id, range, step, result: c.query(&req).await }
+                let result = c.query(&req).await.map(|r| PanelData::prepare(r, range, step, keep_frames));
+                Msg::PanelData { generation, query_gen, panel_id, range, result }
             });
         }
-        self.load_annotations();
     }
 
     pub fn load_annotations(&mut self) {
@@ -554,26 +587,20 @@ impl App {
                 }
                 self.resolve_vars(rest, then_query);
             }
-            Msg::PanelData { generation, query_gen, panel_id, range, step, result } => {
+            Msg::PanelData { generation, query_gen, panel_id, range, result } => {
                 let Some(d) = &mut self.dash else { return };
                 if d.generation != generation || d.query_gen != query_gen {
                     return;
                 }
-                let data = match result {
-                    Ok(resp) => {
-                        let frames = resp.frames();
-                        PanelData {
-                            series: series_from_frames(&frames),
-                            logs: logs_from_frames(&frames),
-                            frames,
-                            errors: resp.errors(),
-                            loading: false,
-                            range,
-                            step: Some(step),
-                        }
-                    }
-                    Err(e) => PanelData { errors: vec![e.to_string()], range, ..Default::default() },
-                };
+                let data = result.unwrap_or_else(|e| PanelData { errors: vec![e.to_string()], range, ..Default::default() });
+                tracing::debug!(
+                    panel = panel_id,
+                    points = data.points,
+                    series = data.series.len(),
+                    per_series = data.series.first().map(|s| s.points.len()),
+                    "panel data"
+                );
+                self.perf.points(data.points);
                 d.data.insert(panel_id, data);
             }
             Msg::Annotations { generation, items } => {
@@ -884,8 +911,7 @@ impl App {
             self.images.clear();
             return true;
         }
-        let timestamps =
-            d.selected_panel().and_then(|p| d.data.get(&p.id).map(|data| chart_spec(p, data, &[]).timestamps())).unwrap_or_default();
+        let timestamps = d.selected_panel().and_then(|p| d.data.get(&p.id).map(crate::render::panels::timestamps)).unwrap_or_default();
         match d.cursor.handle(acts, &timestamps, range) {
             ChartOutcome::Moved => return true,
             ChartOutcome::Zoom(a, b) => {
@@ -1365,6 +1391,15 @@ impl App {
             }
         }
         let scroll = d.scroll;
+        // Panels within one screen of the viewport get queried first.
+        d.near = boxes
+            .iter()
+            .filter(|(_, r)| {
+                let top = r.y as i32 - scroll as i32;
+                top + r.height as i32 > -(area.height as i32) && top < 2 * area.height as i32
+            })
+            .filter_map(|(i, _)| d.order.get(*i).and_then(|pi| dash.panels.get(*pi)).map(|p| p.id))
+            .collect();
         let overlay_base = Overlay { crosshair: d.cursor.crosshair, selection: d.cursor.selection, focused: false };
         let range = self.time.current().resolve(now_ms());
         for (idx, vbox) in boxes {
@@ -1380,7 +1415,18 @@ impl App {
             }
             let Some(panel) = d.panel(idx).cloned() else { continue };
             let selected = idx == d.selected;
-            let data = d.data.get(&panel.id).cloned().unwrap_or(PanelData { loading: true, range, ..Default::default() });
+            let placeholder;
+            let data = match d.data.get(&panel.id) {
+                Some(x) if x.range != (0, 0) => x,
+                Some(x) => {
+                    placeholder = PanelData { range, ..x.clone() };
+                    &placeholder
+                }
+                None => {
+                    placeholder = PanelData { loading: true, range, ..Default::default() };
+                    &placeholder
+                }
+            };
             let mut title = vec![Span::styled(
                 format!(" {} ", panel.title),
                 Style::default().add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
@@ -1413,19 +1459,17 @@ impl App {
                 .title(Line::from(title));
             let inner = block.inner(rect);
             f.render_widget(block, rect);
-            let data = PanelData { range: if data.range == (0, 0) { range } else { data.range }, ..data };
-            let annotations = d.annotations.clone();
             let mut ctx = PanelCtx {
                 gfx: &self.gfx,
                 cache: &mut self.images,
                 marker: self.marker,
                 overlay: Overlay { focused: selected && focused_main, ..overlay_base },
-                annotations: &annotations,
+                annotations: &d.annotations,
                 images: images_ok,
                 key: format!("{}:{}:{}", d.uid, panel.id, inner.height),
                 wrap_logs: false,
             };
-            let chart = render_panel(&panel, &data, inner, f.buffer_mut(), &mut ctx);
+            let chart = render_panel(&panel, data, inner, f.buffer_mut(), &mut ctx);
             self.hit.panels.push((idx, rect, chart));
         }
         // Scroll indicator.

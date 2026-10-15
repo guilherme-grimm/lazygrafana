@@ -67,6 +67,8 @@ pub struct ChartSpec {
     pub fill_opacity: f64,
     pub line_width: f64,
     pub stacking: bool,
+    /// Identity of the underlying data (0 = unknown, hash the points instead).
+    pub version: u64,
 }
 
 impl Default for ChartSpec {
@@ -85,6 +87,7 @@ impl Default for ChartSpec {
             fill_opacity: 0.0,
             line_width: 1.0,
             stacking: false,
+            version: 0,
         }
     }
 }
@@ -154,13 +157,18 @@ impl ChartSpec {
     pub fn base_hash(&self) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.range.hash(&mut h);
-        for s in &self.series {
-            s.name.hash(&mut h);
-            s.color.hash(&mut h);
-            s.points.len().hash(&mut h);
-            for (t, v) in &s.points {
-                t.hash(&mut h);
-                v.map(f64::to_bits).hash(&mut h);
+        if self.version != 0 {
+            // Versioned data: no need to hash every point.
+            (self.version, self.series.len()).hash(&mut h);
+        } else {
+            for s in &self.series {
+                s.name.hash(&mut h);
+                s.color.hash(&mut h);
+                s.points.len().hash(&mut h);
+                for (t, v) in &s.points {
+                    t.hash(&mut h);
+                    v.map(f64::to_bits).hash(&mut h);
+                }
             }
         }
         format!(
@@ -190,6 +198,54 @@ impl ChartSpec {
         ts.dedup();
         ts
     }
+}
+
+/// Reduces `points` to at most ~2 per bucket (min and max, in time order) so
+/// drawing cost follows the pixel width, while spikes stay visible. Gaps
+/// (`None`) are preserved.
+pub fn downsample(points: &[(Millis, Option<f64>)], range: (Millis, Millis), buckets: usize) -> Vec<(Millis, Option<f64>)> {
+    if buckets == 0 || points.len() <= buckets * 2 {
+        return points.to_vec();
+    }
+    let (from, to) = range;
+    let span = to.saturating_sub(from).max(1) as f64;
+    let bucket_of = |t: Millis| (((t.saturating_sub(from)) as f64 / span * buckets as f64) as i64).clamp(-1, buckets as i64);
+    let mut out = Vec::with_capacity(buckets * 2 + 2);
+    let mut i = 0;
+    while i < points.len() {
+        let b = bucket_of(points[i].0);
+        let mut lo: Option<(Millis, f64)> = None;
+        let mut hi: Option<(Millis, f64)> = None;
+        let mut gap = false;
+        while i < points.len() && bucket_of(points[i].0) == b {
+            match points[i].1 {
+                Some(v) => {
+                    if lo.is_none_or(|(_, l)| v < l) {
+                        lo = Some((points[i].0, v));
+                    }
+                    if hi.is_none_or(|(_, h)| v > h) {
+                        hi = Some((points[i].0, v));
+                    }
+                }
+                None => gap = true,
+            }
+            i += 1;
+        }
+        match (lo, hi) {
+            (Some(l), Some(h)) if l.0 == h.0 => out.push((l.0, Some(l.1))),
+            (Some(l), Some(h)) => {
+                let (a, b) = if l.0 < h.0 { (l, h) } else { (h, l) };
+                out.push((a.0, Some(a.1)));
+                out.push((b.0, Some(b.1)));
+            }
+            _ => {}
+        }
+        if gap {
+            let t = out.last().map(|p| p.0 + 1).unwrap_or(from);
+            out.push((t, None));
+        }
+    }
+    out
 }
 
 /// Nice tick values for the y axis.
@@ -330,8 +386,14 @@ impl ChartLayout {
     }
 }
 
-/// Draws the plot with sub-cell Unicode markers (braille/octant/half-block).
+/// Draws the plot with sub-cell Unicode markers (braille/octant/half-block), then the overlay.
 pub fn render_unicode(spec: &ChartSpec, layout: &ChartLayout, overlay: &Overlay, marker: Marker, buf: &mut Buffer) {
+    render_unicode_base(spec, layout, marker, buf);
+    render_overlay_cells(spec, layout, overlay, buf);
+}
+
+/// The static part of a Unicode chart (grid, thresholds, annotations, series) — cacheable.
+pub fn render_unicode_base(spec: &ChartSpec, layout: &ChartLayout, marker: Marker, buf: &mut Buffer) {
     let plot = layout.plot;
     let (lo, hi) = layout.y_bounds;
     let (from, to) = spec.range;
@@ -430,7 +492,6 @@ pub fn render_unicode(spec: &ChartSpec, layout: &ChartLayout, overlay: &Overlay,
         }
     });
     canvas.render(plot, buf);
-    render_overlay_cells(spec, layout, overlay, buf);
 }
 
 /// Crosshair and selection as cell styling (Unicode tier, and on top of images where possible).
@@ -484,6 +545,20 @@ mod tests {
             range: (0, 59 * 60_000),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn downsampling_keeps_extremes_and_gaps() {
+        let mut pts: Vec<(Millis, Option<f64>)> = (0..1000).map(|i| (i, Some(1.0))).collect();
+        pts[500].1 = Some(100.0); // a spike
+        pts[700].1 = None; // a gap
+        let d = downsample(&pts, (0, 999), 50);
+        assert!(d.len() <= 50 * 3, "{}", d.len());
+        assert!(d.iter().any(|(_, v)| *v == Some(100.0)), "spike kept");
+        assert!(d.iter().any(|(_, v)| v.is_none()), "gap kept");
+        assert!(d.windows(2).all(|w| w[0].0 <= w[1].0), "time ordered");
+        let small: Vec<(Millis, Option<f64>)> = (0..10).map(|i| (i, Some(i as f64))).collect();
+        assert_eq!(downsample(&small, (0, 9), 50), small);
     }
 
     #[test]

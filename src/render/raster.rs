@@ -401,7 +401,7 @@ mod snapshot {
         let (a, b) = (series[0].points[0].0, series[0].points.last().unwrap().0);
         let data = PanelData { frames, series, range: (a, b), ..Default::default() };
         let ann = [ChartAnnotation { start: a + (b - a) / 3, end: a + (b - a) / 3, color: (0x57, 0x94, 0xF2), text: "deploy".into() }];
-        let spec = chart_spec(panel, &data, &ann);
+        let spec = chart_spec(panel, &data, &ann, 10_000);
         let layout = ChartLayout::compute(&spec, ratatui::layout::Rect::new(0, 0, 100, 20));
         let (w, h) = (layout.plot.width as u32 * 10, layout.plot.height as u32 * 20);
         let base = render_base(&spec, &layout, w, h, 20).unwrap();

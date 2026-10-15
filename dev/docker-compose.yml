@@ -6,6 +6,8 @@
 # Profiles:
 #   compat    - also starts Grafana 11 (minimum supported version) on :3011
 #   renderer  - starts the Grafana Image Renderer (for the "exact view" feature)
+#   load      - high-cardinality metrics (avalanche) and log floods for load testing;
+#               seed matching dashboards/alerts with `make load-seed`
 
 name: lazygrafana-dev
 
@@ -73,6 +75,9 @@ services:
       - -config.file=/etc/loki/local-config.yaml
       # Dev machines often run >90% disk; don't let the WAL silently drop logs.
       - -ingester.wal-disk-full-threshold=0
+      # Headroom for the load profile (~2 MB/s steady, bursts on catch-up).
+      - -distributor.ingestion-rate-limit-mb=32
+      - -distributor.ingestion-burst-size-mb=64
     ports: ["${LOKI_PORT:-3100}:3100"]
     volumes:
       - loki-data:/loki
@@ -113,6 +118,50 @@ services:
     image: mingrammer/flog:${FLOG_VERSION:-0.4.3}
     restart: unless-stopped
     command: [--format=apache_error, --loop, --delay=2s]
+
+  # ---- load profile ---------------------------------------------------------
+  # ~12k gauge series + ~10k histogram bucket series.
+  avalanche:
+    image: quay.io/prometheuscommunity/avalanche:${AVALANCHE_VERSION:-v0.7.0}
+    profiles: [load]
+    restart: unless-stopped
+    command:
+      - --gauge-metric-count=40
+      - --histogram-metric-count=4
+      - --series-count=300
+      - --label-count=4
+      - --value-interval=15
+      - --series-interval=86400
+      - --metric-interval=0
+
+  # One metric with 3000 series: a variable with thousands of options.
+  avalanche-wide:
+    image: quay.io/prometheuscommunity/avalanche:${AVALANCHE_VERSION:-v0.7.0}
+    profiles: [load]
+    restart: unless-stopped
+    command:
+      - --gauge-metric-count=1
+      - --series-count=3000
+      - --label-count=2
+      - --value-interval=15
+      - --series-interval=86400
+      - --metric-interval=0
+      - --const-label=wide=true
+
+  # ~1000 lines/s per replica.
+  load-logs:
+    image: mingrammer/flog:${FLOG_VERSION:-0.4.3}
+    profiles: [load]
+    restart: unless-stopped
+    command: [--format=json, --loop, --delay=1ms]
+    deploy:
+      replicas: 4
+
+  load-logs-apache:
+    image: mingrammer/flog:${FLOG_VERSION:-0.4.3}
+    profiles: [load]
+    restart: unless-stopped
+    command: [--format=apache_error, --loop, --delay=5ms]
 
 volumes:
   grafana-data:

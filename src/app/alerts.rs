@@ -15,8 +15,8 @@ use super::keymap::Act;
 use super::msg::{After, Msg};
 use super::popup::{InputPurpose, Pending, Popup};
 use super::widgets::{InputResult, ListNav, Scroll, TextInput, fuzzy_filter, truncate};
-use super::{App, Focus, Side, label_key};
-use crate::grafana::dataframe::{Values, series_from_frames};
+use super::{App, Focus, Side};
+use crate::grafana::dataframe::Values;
 use crate::grafana::models::{Matcher, NewSilence, Rule, RuleGroup, Silence};
 use crate::render::chart::Overlay;
 use crate::render::panels::{PanelCtx, PanelData, render_chart};
@@ -284,11 +284,11 @@ impl App {
                 return;
             }
         };
-        let (q, _) = super::query::adhoc_query(&ds, &rule.query, range, 600, 100);
+        let (q, step) = super::query::adhoc_query(&ds, &rule.query, range, 600, 100);
         self.alerts.chart_loading.insert(uid.clone());
         self.spawn_query(move |c| async move {
             let req = crate::grafana::QueryRequest { from: range.0, to: range.1, queries: vec![q] };
-            Msg::RuleChart { uid, range, result: c.query(&req).await }
+            Msg::RuleChart { uid, range, result: c.query(&req).await.map(|r| PanelData::prepare(r, range, step, false)) }
         });
     }
 
@@ -363,44 +363,39 @@ impl App {
             }
             Msg::RuleChart { uid, range, result } => {
                 self.alerts.chart_loading.remove(&uid);
-                let data = match result {
-                    Ok(r) => {
-                        let frames = r.frames();
-                        PanelData { series: series_from_frames(&frames), frames, errors: r.errors(), range, ..Default::default() }
-                    }
-                    Err(e) => PanelData { errors: vec![e.to_string()], range, ..Default::default() },
-                };
+                let data = result.unwrap_or_else(|e| PanelData { errors: vec![e.to_string()], range, ..Default::default() });
                 self.alerts.chart.insert(uid, data);
             }
             _ => {}
         }
     }
 
+    /// Notifies per *rule* (not per instance): multi-dimensional rules with
+    /// flapping instances would otherwise spam the desktop.
     fn notify_new_firing(&mut self, groups: &[RuleGroup]) {
         let mut current = HashSet::new();
         let mut details: HashMap<String, (String, String)> = HashMap::new();
         for g in groups {
-            for r in &g.rules {
-                for a in r.alerts.iter().filter(|a| a.state == "Alerting") {
-                    let key = label_key(&r.uid, &a.labels);
-                    let summary =
-                        a.annotations.get("summary").or_else(|| r.annotations.get("summary")).cloned().unwrap_or_else(|| g.file.clone());
-                    details.insert(key.clone(), (r.name.clone(), summary));
-                    current.insert(key);
-                }
+            for r in g.rules.iter().filter(|r| r.alerts.iter().any(|a| a.state == "Alerting")) {
+                let summary = r.annotations.get("summary").cloned().unwrap_or_else(|| g.file.clone());
+                details.insert(r.uid.clone(), (r.name.clone(), summary));
+                current.insert(r.uid.clone());
             }
         }
         if let Some(prev) = &self.alerts.firing_seen
             && self.config.notifications
         {
             let new: Vec<&String> = current.difference(prev).collect();
-            for key in new.iter().take(3) {
-                if let Some((name, summary)) = details.get(*key) {
-                    crate::term::notify(&format!("Firing: {name}"), summary);
-                }
+            if let [only] = new.as_slice()
+                && let Some((name, summary)) = details.get(*only)
+            {
+                crate::term::notify(&format!("Firing: {name}"), summary);
+            } else if !new.is_empty() {
+                let names: Vec<&str> = new.iter().filter_map(|k| details.get(*k).map(|(n, _)| n.as_str())).take(5).collect();
+                crate::term::notify(&format!("{} rules started firing", new.len()), &names.join(", "));
             }
             if !new.is_empty() {
-                self.toast_err(format!("{} alert(s) started firing", new.len()));
+                self.toast_err(format!("{} rule(s) started firing", new.len()));
             }
         }
         self.alerts.firing_seen = Some(current);
